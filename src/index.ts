@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ListResourcesRequestSchema, ReadResourceRequestSchema, ListToolsRequestSchema, CallToolRequestSchema, ErrorCode, McpError, TextContent } from "@modelcontextprotocol/sdk/types.js";
+import { ListResourcesRequestSchema, ReadResourceRequestSchema, ListToolsRequestSchema, CallToolRequestSchema, ErrorCode, McpError, ImageContent } from "@modelcontextprotocol/sdk/types.js";
 import axios from "axios";
 import dotenv from "dotenv";
 import { isValidImageGenerationArgs, ImageGenerationArgs, ImageGeneration } from "./types.js";
@@ -18,7 +18,13 @@ const SILICONFLOW_API_CONFIG = {
         // Updated endpoint
         IMAGE_GENERATION: '/v1/images/generations'
     },
-    MODEL_ID: "black-forest-labs/FLUX.1-schnell", // Specific model
+    // ⚠️ 默认模型改为 Qwen/Qwen-Image。
+    // 实测 (2026-10-08)：FLUX 系列（black-forest-labs/*）在 api.siliconflow.com 上返回的
+    // s3.us-east-1.amazonaws.com 预签名 URL 从生成那一刻起签名就无效（SignatureDoesNotMatch，
+    // 立即下载也是 403），因为其 Credential scope 用的是 us-east-1 且缺少 X-Amz-Security-Token。
+    // Tongyi-MAI/Z-Image-Turbo 走 s3.siliconflow.cn，签名正常、可直接下载。
+    // 可用环境变量 SILICONFLOW_MODEL 覆盖。
+    MODEL_ID: process.env.SILICONFLOW_MODEL || "Tongyi-MAI/Z-Image-Turbo",
     DEFAULT_PARAMS: {
         // Defaults from the example or common values
         num_inference_steps: 20,
@@ -116,7 +122,7 @@ class SiliconFlowFluxMcpServer { // Renamed class for clarity
                 {
                     // Tool Definition for SiliconFlow Flux
                     name: "generate_image", // Keep the name simple for the AI
-                    description: `Generates an image using the SiliconFlow API with the Flux Schnell model (black-forest-labs/FLUX.1-schnell). Provide a detailed English prompt and select a resolution. Nya~ <3\n重要提示：\n1. 此工具返回一个基础的 HTML \`<img>\` 标签（包含 src 和 alt）。\n2. 请在收到此标签后，为其添加一个 \`width\` 属性，值应在 200 到 500 像素之间（例如 \`width="300"\`）。\n3. 在最终回复用户时，请直接发送这个*完整的*、已添加 \`width\` 属性的 HTML \`<img>\` 标签，以便用户可以直接看到图片。`,
+                    description: `Generates an image using the SiliconFlow API. Provide a detailed English prompt and select a resolution. Nya~ <3\n返回内容说明：服务端已自行下载图片字节并以 MCP image 内容块内联返回，客户端直接渲染即可。\n请勿再输出 HTML \`<img>\` 标签、\`width\` 属性或外部图片链接 —— 图片已经在你手中了。`,
                     inputSchema: {
                         type: "object",
                         properties: {
@@ -210,18 +216,54 @@ class SiliconFlowFluxMcpServer { // Renamed class for clarity
             }
             // --- End Response Processing ---
             // --- Format Output for AI/User ---
-            // Return the image as a Markdown link
             const usedSeedText = usedSeed ? ` (Seed: ${usedSeed})` : ''; // 可选：把种子也加上
-            const altText = params.prompt.substring(0, 50) + (params.prompt.length > 50 ? '...' : ''); // 用部分提示做 Alt Text
-            // Revert: Return only the basic img tag. AI will add width based on description.
-            const htmlImage: TextContent = {
-                type: "text",
-                // Format as basic HTML img tag
-                text: `<img src="${imageUrl}" alt="${altText}">${usedSeedText}`
-            };
-            return {
-                content: [htmlImage] // Return the HTML image directly
-            };
+
+            // ⚠️ 关键：绝不把「临时签名 URL」直接交给用户/上层模型。
+            // 这类链接可能随时失效，更可能像 FLUX 那样从生成那刻起就是坏的签名。
+            // 这里由服务端自己把字节流取回来，转成 MCP image 内容块内联返回，彻底绕开链接问题。
+            try {
+                // 用裸 axios，不用 siliconflowAxiosInstance：图片在 S3 上，
+                // 带上 API 的 Authorization 头会与 URL 里的 X-Amz-* 鉴权冲突（S3 只允许一种鉴权机制）。
+                const imgResp = await axios.get(imageUrl, {
+                    responseType: "arraybuffer",
+                    timeout: 120000
+                });
+                // S3 常返回 application/octet-stream，而 MCP 客户端靠 mimeType 决定渲不渲染，
+                // 所以这里必须收敛成真正的图片类型，否则客户端可能不显示。
+                const rawMime = (imgResp.headers['content-type'] as string) || '';
+                const mimeType = rawMime.startsWith('image/') ? rawMime : 'image/png';
+                const imageBlock: ImageContent = {
+                    type: "image",
+                    data: Buffer.from(imgResp.data).toString("base64"),
+                    mimeType
+                };
+                return {
+                    content: [
+                        imageBlock,
+                        { type: "text", text: `已生成图片：${params.resolution}${usedSeedText}` }
+                    ]
+                };
+            } catch (dlErr) {
+                // 降级：下载失败也要把原因说清楚，而不是甩一个点不开的链接给用户
+                let reason = String(dlErr);
+                if (axios.isAxiosError(dlErr)) {
+                    const body = typeof dlErr.response?.data === 'string'
+                        ? dlErr.response.data
+                        : Buffer.isBuffer(dlErr.response?.data)
+                            ? dlErr.response.data.toString('utf8')
+                            : '';
+                    const s3Code = body.match(/<Code>([^<]*)<\/Code>/)?.[1];
+                    reason = `HTTP ${dlErr.response?.status ?? 'N/A'}${s3Code ? ` (${s3Code})` : ''} - ${dlErr.message}`;
+                }
+                console.error("Failed to download generated image:", dlErr);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `图片已生成，但服务端下载失败：${reason}\n模型 ${SILICONFLOW_API_CONFIG.MODEL_ID} 返回的链接无法访问。原始链接（临时，大概率也点不开）：${imageUrl}`
+                    }],
+                    isError: true
+                };
+            }
             // --- End Formatting Output ---
         } catch (error) {
             console.error("Error calling SiliconFlow API:", error);
