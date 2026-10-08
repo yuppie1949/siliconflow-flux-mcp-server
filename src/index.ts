@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ListResourcesRequestSchema, ReadResourceRequestSchema, ListToolsRequestSchema, CallToolRequestSchema, ErrorCode, McpError, ImageContent } from "@modelcontextprotocol/sdk/types.js";
+import { ListResourcesRequestSchema, ReadResourceRequestSchema, ListToolsRequestSchema, CallToolRequestSchema, ErrorCode, McpError, TextContent } from "@modelcontextprotocol/sdk/types.js";
 import axios from "axios";
 import dotenv from "dotenv";
 import { isValidImageGenerationArgs, ImageGenerationArgs, ImageGeneration } from "./types.js";
@@ -124,7 +124,7 @@ class SiliconFlowFluxMcpServer { // Renamed class for clarity
                 {
                     // Tool Definition for SiliconFlow Flux
                     name: "generate_image", // Keep the name simple for the AI
-                    description: `Generates an image using the SiliconFlow API. Provide a detailed English prompt and select a resolution. Nya~ <3\n返回内容说明：服务端已自行下载图片字节并以 MCP image 内容块内联返回，客户端直接渲染即可。\n请勿再输出 HTML \`<img>\` 标签、\`width\` 属性或外部图片链接 —— 图片已经在你手中了。`,
+                    description: `Generates an image using the SiliconFlow API. Provide a detailed English prompt and select a resolution. Nya~ <3\n重要提示：\n1. 此工具返回一个基础的 HTML \`<img>\` 标签（包含 src 和 alt）。\n2. 请在收到此标签后，为其添加一个 \`width\` 属性，值应在 200 到 500 像素之间（例如 \`width="300"\`）。\n3. 在最终回复用户时，请直接发送这个*完整的*、已添加 \`width\` 属性的 HTML \`<img>\` 标签，以便用户可以直接看到图片。`,
                     inputSchema: {
                         type: "object",
                         properties: {
@@ -219,53 +219,16 @@ class SiliconFlowFluxMcpServer { // Renamed class for clarity
             // --- End Response Processing ---
             // --- Format Output for AI/User ---
             const usedSeedText = usedSeed ? ` (Seed: ${usedSeed})` : ''; // 可选：把种子也加上
-
-            // ⚠️ 关键：绝不把「临时签名 URL」直接交给用户/上层模型。
-            // 这类链接可能随时失效，更可能像 FLUX 那样从生成那刻起就是坏的签名。
-            // 这里由服务端自己把字节流取回来，转成 MCP image 内容块内联返回，彻底绕开链接问题。
-            try {
-                // 用裸 axios，不用 siliconflowAxiosInstance：图片在 S3 上，
-                // 带上 API 的 Authorization 头会与 URL 里的 X-Amz-* 鉴权冲突（S3 只允许一种鉴权机制）。
-                const imgResp = await axios.get(imageUrl, {
-                    responseType: "arraybuffer",
-                    timeout: 120000
-                });
-                // S3 常返回 application/octet-stream，而 MCP 客户端靠 mimeType 决定渲不渲染，
-                // 所以这里必须收敛成真正的图片类型，否则客户端可能不显示。
-                const rawMime = (imgResp.headers['content-type'] as string) || '';
-                const mimeType = rawMime.startsWith('image/') ? rawMime : 'image/png';
-                const imageBlock: ImageContent = {
-                    type: "image",
-                    data: Buffer.from(imgResp.data).toString("base64"),
-                    mimeType
-                };
-                return {
-                    content: [
-                        imageBlock,
-                        { type: "text", text: `已生成图片：${params.resolution}${usedSeedText}` }
-                    ]
-                };
-            } catch (dlErr) {
-                // 降级：下载失败也要把原因说清楚，而不是甩一个点不开的链接给用户
-                let reason = String(dlErr);
-                if (axios.isAxiosError(dlErr)) {
-                    const body = typeof dlErr.response?.data === 'string'
-                        ? dlErr.response.data
-                        : Buffer.isBuffer(dlErr.response?.data)
-                            ? dlErr.response.data.toString('utf8')
-                            : '';
-                    const s3Code = body.match(/<Code>([^<]*)<\/Code>/)?.[1];
-                    reason = `HTTP ${dlErr.response?.status ?? 'N/A'}${s3Code ? ` (${s3Code})` : ''} - ${dlErr.message}`;
-                }
-                console.error("Failed to download generated image:", dlErr);
-                return {
-                    content: [{
-                        type: "text",
-                        text: `图片已生成，但服务端下载失败：${reason}\n模型 ${SILICONFLOW_API_CONFIG.MODEL_ID} 返回的链接无法访问。原始链接（临时，大概率也点不开）：${imageUrl}`
-                    }],
-                    isError: true
-                };
-            }
+            // 用部分提示做 Alt Text；去掉可能破坏 HTML 属性的引号/尖括号
+            const altText = params.prompt.substring(0, 50).replace(/["<>]/g, ' ') + (params.prompt.length > 50 ? '...' : '');
+            // 直接返回在线图片链接（HTML <img> 标签），由模型加 width 后原样发给用户
+            const htmlImage: TextContent = {
+                type: "text",
+                text: `<img src="${imageUrl}" alt="${altText}">${usedSeedText}`
+            };
+            return {
+                content: [htmlImage]
+            };
             // --- End Formatting Output ---
         } catch (error) {
             console.error("Error calling SiliconFlow API:", error);
