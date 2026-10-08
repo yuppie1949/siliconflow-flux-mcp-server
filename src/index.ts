@@ -13,7 +13,7 @@ if (!SILICONFLOW_API_KEY) {
     throw new Error("主人！SILICONFLOW_API_KEY environment variable is required nya~ Set it in your .env file!");
 }
 const SILICONFLOW_API_CONFIG = {
-    BASE_URL: 'https://api.siliconflow.cn',
+    BASE_URL: process.env.SILICONFLOW_BASE_URL || 'https://api.siliconflow.com',
     ENDPOINTS: {
         // Updated endpoint
         IMAGE_GENERATION: '/v1/images/generations'
