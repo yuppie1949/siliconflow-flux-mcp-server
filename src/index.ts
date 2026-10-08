@@ -18,11 +18,13 @@ const SILICONFLOW_API_CONFIG = {
         // Updated endpoint
         IMAGE_GENERATION: '/v1/images/generations'
     },
-    // ⚠️ 默认模型改为 Qwen/Qwen-Image。
-    // 实测 (2026-10-08)：FLUX 系列（black-forest-labs/*）在 api.siliconflow.com 上返回的
-    // s3.us-east-1.amazonaws.com 预签名 URL 从生成那一刻起签名就无效（SignatureDoesNotMatch，
-    // 立即下载也是 403），因为其 Credential scope 用的是 us-east-1 且缺少 X-Amz-Security-Token。
-    // Tongyi-MAI/Z-Image-Turbo 走 s3.siliconflow.cn，签名正常、可直接下载。
+    // ⚠️ 默认模型：Tongyi-MAI/Z-Image-Turbo（$0.005/张，实测推理 ~3.6s，走 s3.siliconflow.cn）。
+    // 实测 (2026-10-08) 全量扫描 12 个文生图模型，结果是：
+    //   仅 FLUX.1-schnell 与 FLUX.1-dev 返回的 s3.us-east-1.amazonaws.com 预签名 URL 签名无效
+    //   —— 生成后立即下载也是 403 SignatureDoesNotMatch（Credential scope 为 us-east-1
+    //   且缺少 X-Amz-Security-Token）。这两个恰好是全场最便宜的模型，别选它们。
+    //   其余模型均正常：Z-Image-Turbo / Qwen-Image 走 s3.siliconflow.cn，
+    //   FLUX.2-* / FLUX-1.1-* / Kontext-* 走 BFL 官方 CDN delivery.*.bfl.ai。
     // 可用环境变量 SILICONFLOW_MODEL 覆盖。
     MODEL_ID: process.env.SILICONFLOW_MODEL || "Tongyi-MAI/Z-Image-Turbo",
     DEFAULT_PARAMS: {
